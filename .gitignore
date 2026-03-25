@@ -1,3 +1,10 @@
-.DS_Store
-dist
-build
+dist/
+build/
+*.egg-info/
+dl/build/
+
+.python-version
+dl/uv.lock
+*.venv/
+*dist
+*.DS_Store
