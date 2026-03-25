@@ -12,33 +12,24 @@ Dependencies:
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import threading
-import re
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
+from rich import box
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
-from rich.progress import (
-    Progress,
-    TaskID,
-    BarColumn,
-    DownloadColumn,
-    TransferSpeedColumn,
-    TimeRemainingColumn,
-    TextColumn,
-    SpinnerColumn,
-    ProgressColumn,
-)
 from rich.panel import Panel
+from rich.progress import (
+    TaskID,
+)
+from rich.table import Table
 from rich.text import Text
-from rich import box
-
 
 STATUS_WAITING = "waiting"
 STATUS_FETCHING = "fetching"

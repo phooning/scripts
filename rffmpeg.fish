@@ -29,6 +29,7 @@ function rffmpeg --description "Recursively multithread convert media files usin
     set -l skipped_count 0
 
     # Helper: check if an encoder is available in this ffmpeg build
+    # TODO: Runs inside a function once per call.
     function __ffmpeg_has_encoder
         ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "^ ...... $argv[1]"
     end
@@ -160,6 +161,7 @@ function rffmpeg --description "Recursively multithread convert media files usin
     end
 
     # Set statistics for total found and skipped files.
+    # TODO: Consolidate into one `fd` pipeline to avoid double traversal.
     set total_found (fd -e "$input_ext" | count)
     for file in (fd -e "$input_ext")
         set output_file (string replace -r "\.$input_ext\$" "\.$output_ext" (string lower $file))
@@ -178,9 +180,11 @@ function rffmpeg --description "Recursively multithread convert media files usin
         return 0
     end
 
+    # TODO: Fix shell injection - defer to `parallel` `:::` and `--colsep`.
     set -l ffmpeg_flags_str (string join -- " " $ffmpeg_flags)
     echo "Running ffmpeg preset $_flag_preset; flags: $ffmpeg_flags"
 
+    # TOOD: `--progress` and `--eta` have stderr noise. Consider `logleve quiet`
     fd -e "$input_ext" -0 | parallel -0 --progress --eta \
         "test -f '{.}.$output_ext' || ffmpeg -hide_banner -loglevel error -stats -i {} $ffmpeg_flags_str '{.}.$output_ext'"
 end
