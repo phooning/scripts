@@ -1,0 +1,12 @@
+[project]
+name = "rffmpeg"
+version = "0.1.0"
+description = "Recursive parallelized ffmpeg conversions."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+[project.scripts]
+rffmpeg = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
