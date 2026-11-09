@@ -16,6 +16,7 @@ Dependencies:
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,27 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+# ── yt-dlp invocation / self-update ──────────────────────────────────────────
+
+# Always use the yt-dlp installed alongside this script (the one that
+# update_ytdlp() upgrades), not whatever happens to be first on PATH.
+YTDLP: list[str] = [sys.executable, "-m", "yt_dlp"]
+
+
+def update_ytdlp() -> None:
+    """Upgrade yt-dlp in this interpreter's environment. Failures are non-fatal."""
+    if shutil.which("uv"):
+        cmd = ["uv", "pip", "install", "--quiet", "--upgrade",
+               "--python", sys.executable, "yt-dlp"]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"[warn] yt-dlp update failed: {r.stderr.strip()[-200:]}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[warn] yt-dlp update failed: {exc}", file=sys.stderr)
 
 # ── Status constants ──────────────────────────────────────────────────────────
 
@@ -64,6 +86,7 @@ _DEST_RE    = re.compile(r"\[download\] Destination: (.+)")
 _TITLE_RE   = re.compile(r"\[(?:youtube|soundcloud|vimeo|info)\].*?: (.+)")
 _MERGE_RE   = re.compile(r"\[Merger\]|Merging")
 _FMT_ROW_RE = re.compile(r"^(\S+)\s")
+_AUDIO_TBR_RE = re.compile(r"\s(\d+(?:\.\d+)?)k\s+https\b")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -76,6 +99,7 @@ class DownloadState:
     speed: str    = ""
     eta: str      = ""
     error: str    = ""
+    dest: str     = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 # ── yt-dlp output parser ──────────────────────────────────────────────────────
@@ -83,6 +107,10 @@ class DownloadState:
 def parse_ytdlp_line(line: str, state: DownloadState) -> None:
     """Update DownloadState from a single yt-dlp --newline output line."""
     with state.lock:
+        if line.startswith("DLPATH:"):
+            state.dest = line[len("DLPATH:"):]
+            return
+
         if _MERGE_RE.search(line):
             state.status = STATUS_MERGE
             return
@@ -128,7 +156,7 @@ def get_archive_key(url: str) -> Optional[str]:
     try:
         out = subprocess.check_output(
             [
-                "yt-dlp",
+                *YTDLP,
                 "--skip-download",
                 "--print", "%(extractor)s %(id)s",
                 "--no-warnings",
@@ -203,7 +231,7 @@ def resolve_format(url: str, state: DownloadState) -> Optional[str]:
 
     try:
         result = subprocess.run(
-            ["yt-dlp", "-F", url],
+            [*YTDLP, "-F", url],
             capture_output=True, text=True, timeout=60,
         )
         lines      = result.stdout.splitlines()
@@ -215,6 +243,55 @@ def resolve_format(url: str, state: DownloadState) -> Optional[str]:
     except Exception:
         return None
 
+def resolve_audio_format(url: str, state: DownloadState, proxy: str) -> str:
+    """
+    Pick the best direct (https) audio-only format ID from `yt-dlp -F`
+    (e.g. 251 for opus webm). Falls back to yt-dlp's "bestaudio/best".
+
+    No player_client override is used: forcing the `web` client can expose
+    no audio formats at all for some videos.
+    """
+    with state.lock:
+        state.status = STATUS_FETCHING
+        state.title  = "querying formats…"
+    cmd = [*YTDLP, "--ignore-config", "--no-warnings", "-F", url]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return "bestaudio/best"
+    best: Optional[tuple[float, str]] = None
+    for line in out.splitlines():
+        if "audio only" not in line:
+            continue
+        m_id, m_br = _FMT_ROW_RE.match(line.strip()), _AUDIO_TBR_RE.search(line)
+        if m_id and m_br:
+            cand = (float(m_br.group(1)), m_id.group(1))
+            if best is None or cand[0] > best[0]:
+                best = cand
+    return best[1] if best else "bestaudio/best"
+
+
+def convert_to_mp4(src: Path, state: DownloadState) -> None:
+    """ffmpeg the downloaded audio stream into an AAC .mp4; remove source."""
+    dst = src.with_suffix(".mp4")
+    with state.lock:
+        state.status = STATUS_MERGE
+    if src == dst:
+        return
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+         "-vn", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dst)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr.strip()[-80:]}")
+    src.unlink(missing_ok=True)
+    with state.lock:
+        state.dest = str(dst)
+
+
 # ── Downloader ────────────────────────────────────────────────────────────────
 
 def download(
@@ -224,6 +301,7 @@ def download(
     auto_format: bool,
     archive_path: Optional[Path],
     proxy:       str,
+    audio_only:  bool = False,
 ) -> None:
     """Download one URL, updating state live; append to archive on success."""
 
@@ -234,7 +312,9 @@ def download(
 
     # ── Optional: auto-select best format via yt-dlp -F ──────────────────────
     fmt_args: list[str] = []
-    if auto_format:
+    if audio_only:
+        fmt_args = ["-f", resolve_audio_format(state.url, state, proxy)]
+    elif auto_format:
         fmt = resolve_format(state.url, state)
         if fmt:
             fmt_args = ["-f", fmt]
@@ -244,7 +324,7 @@ def download(
     tmp.close()
 
     cmd = [
-        "yt-dlp",
+        *YTDLP,
         "--newline",
         "-o", f"{output_dir}/%(title)s.%(ext)s",
         "--download-archive", tmp.name,
@@ -253,11 +333,17 @@ def download(
         "--retries",          "10",
         "--user-agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "--extractor-args",   "youtube:player_client=web",
         "--no-warnings",
-        *fmt_args,
-        *extra_args,
     ]
+    if audio_only:
+        # Raw stream download only; conversion is done with ffmpeg afterwards.
+        # Ignore user config (it may embed subs / remux to mkv).
+        cmd += ["--ignore-config", "--no-quiet", "--no-embed-subs",
+                "--no-write-subs", "--no-embed-metadata", "--no-sponsorblock",
+                "--print", "after_move:DLPATH:%(filepath)s"]
+    else:
+        cmd += ["--extractor-args", "youtube:player_client=web"]
+    cmd += [*fmt_args, *extra_args]
     if proxy:
         cmd += ["--proxy", proxy]
     cmd.append(state.url)
@@ -283,6 +369,11 @@ def download(
 
         proc.wait()
 
+        if proc.returncode == 0 and audio_only:
+            if not state.dest:
+                raise RuntimeError("could not determine downloaded file")
+            convert_to_mp4(Path(state.dest), state)
+
         with state.lock:
             if proc.returncode == 0:
                 state.status  = STATUS_DONE
@@ -302,7 +393,7 @@ def download(
     except FileNotFoundError:
         with state.lock:
             state.status = STATUS_ERROR
-            state.error  = "yt-dlp not found — install with: pip install yt-dlp"
+            state.error  = "yt-dlp not found — run: uv tool install --reinstall dl"
     except Exception as exc:
         with state.lock:
             state.status = STATUS_ERROR
@@ -384,7 +475,9 @@ def main() -> None:
     parser.add_argument("--format",  metavar="FMT",
                         help="yt-dlp format string (e.g. 'bestvideo+bestaudio/best')")
     parser.add_argument("--audio-only", "-a", action="store_true",
-                        help="Extract audio only (-x --audio-format mp3)")
+                        help="Download best audio-only stream and convert to AAC .mp4 via ffmpeg")
+    parser.add_argument("--no-update", action="store_true",
+                        help="Skip the automatic yt-dlp upgrade at startup")
     parser.add_argument("--proxy",   metavar="URL", default="",
                         help="Proxy URL (e.g. socks5://127.0.0.1:9050)")
     args, extra = parser.parse_known_args()
@@ -406,13 +499,14 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
 
+    if not args.no_update:
+        update_ytdlp()
+
     # ── Build extra yt-dlp args ───────────────────────────────────────────────
     extra_args:  list[str] = list(extra)
     auto_format: bool      = not args.format and not args.audio_only
     if args.format:
         extra_args += ["-f", args.format]
-    if args.audio_only:
-        extra_args += ["-x", "--audio-format", "mp3"]
 
     archive_path: Optional[Path] = Path(args.archive) if args.archive else None
     Path(args.output).mkdir(parents=True, exist_ok=True)
@@ -469,7 +563,7 @@ def main() -> None:
             futures = {
                 pool.submit(
                     download, s, args.output, extra_args,
-                    auto_format, archive_path, args.proxy
+                    auto_format, archive_path, args.proxy, args.audio_only
                 ): s
                 for s in to_fetch
             }
@@ -497,4 +591,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()
